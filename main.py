@@ -9,7 +9,7 @@ This extension allows users to:
 """
 
 from burp import IBurpExtender, ITab, IExtensionStateListener, IContextMenuFactory, IProxyListener, \
-    ISessionHandlingAction
+    ISessionHandlingAction, IHttpListener
 from java.awt import BorderLayout
 from java.awt.event import ActionListener
 from javax.swing import JMenuItem, DefaultComboBoxModel, SwingUtilities
@@ -29,7 +29,7 @@ from ui.config_tab import ConfigTab
 
 
 class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IContextMenuFactory, IProxyListener,
-                   ISessionHandlingAction):
+                   ISessionHandlingAction, IHttpListener):
     # Extension configuration
     NAME = "BB User Agent"
     SETTING_NAME = "bb_user_agent_settings"
@@ -67,6 +67,7 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IContextMenuFac
 
         # Register listeners
         callbacks.registerProxyListener(self)
+        callbacks.registerHttpListener(self)
         callbacks.registerExtensionStateListener(self)
         callbacks.registerContextMenuFactory(self)
         callbacks.registerSessionHandlingAction(self)
@@ -861,17 +862,17 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IContextMenuFac
             # Skip if using browser UA and no suffix (nothing to change)
             if self.use_browser_user_agent and (not self.user_agent_suffix or not self.user_agent_suffix.strip()):
                 return
-            
+
             # Skip if using predefined UA but no UA selected and no suffix
-            if (not self.use_browser_user_agent and 
-                not self.selected_user_agent and 
+            if (not self.use_browser_user_agent and
+                not self.selected_user_agent and
                 (not self.user_agent_suffix or not self.user_agent_suffix.strip())):
                 return
 
             # Debug info - can be removed later
             print("Processing request - use_browser_ua: {}, selected_ua: {}, suffix: '{}'".format(
-                self.use_browser_user_agent, 
-                self.selected_user_agent if self.selected_user_agent else "None", 
+                self.use_browser_user_agent,
+                self.selected_user_agent if self.selected_user_agent else "None",
                 self.user_agent_suffix if self.user_agent_suffix else ""))
 
             try:
@@ -950,6 +951,113 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener, IContextMenuFac
 
         except Exception as e:
             print("Main proxy error: " + str(e))
+            import traceback
+            traceback.print_exc()
+
+    def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
+        """
+        Process HTTP messages from all Burp tools (including other extensions)
+        This handler applies User-Agent only if it hasn't already been set by the proxy listener
+        """
+        try:
+            # Only process outgoing requests
+            if not messageIsRequest:
+                return
+
+            # Sync UI values first to ensure we have current settings
+            self.sync_current_ui_values()
+
+            # Skip if extension is disabled
+            if not self.extension_enabled:
+                return
+
+            # Skip if using browser UA and no suffix (nothing to change)
+            if self.use_browser_user_agent and (not self.user_agent_suffix or not self.user_agent_suffix.strip()):
+                return
+
+            # Skip if using predefined UA but no UA selected and no suffix
+            if (not self.use_browser_user_agent and
+                not self.selected_user_agent and
+                (not self.user_agent_suffix or not self.user_agent_suffix.strip())):
+                return
+
+            try:
+                request = messageInfo.getRequest()
+                request_info = self._helpers.analyzeRequest(request)
+                headers = request_info.getHeaders()
+
+                # Skip CONNECT requests
+                if headers and headers[0].startswith("CONNECT"):
+                    return
+
+                # Check scope if enabled
+                if self.apply_to_scope_only:
+                    try:
+                        service = messageInfo.getHttpService()
+                        if service:
+                            request_info_with_service = self._helpers.analyzeRequest(service, request)
+                            url = request_info_with_service.getUrl()
+                            if not self._callbacks.isInScope(url):
+                                return
+                    except Exception as e:
+                        print("HTTP Listener - Scope check failed: {}".format(str(e)))
+                        return
+
+                # Get the current User-Agent from the request
+                current_ua = None
+                for header in headers:
+                    if header.lower().startswith("user-agent:"):
+                        current_ua = header.split(":", 1)[1].strip()
+                        break
+
+                # Determine what the target User-Agent should be
+                target_ua = None
+                if self.use_browser_user_agent:
+                    # Get browser UA and add suffix if needed
+                    browser_ua = get_browser_user_agent(self._helpers, self._callbacks)
+                    if browser_ua:
+                        if self.user_agent_suffix and self.user_agent_suffix.strip():
+                            target_ua = browser_ua + " " + self.user_agent_suffix
+                        else:
+                            target_ua = browser_ua
+                    else:
+                        # If we can't get browser UA, use current UA as base
+                        if current_ua:
+                            if self.user_agent_suffix and self.user_agent_suffix.strip():
+                                target_ua = current_ua + " " + self.user_agent_suffix
+                            else:
+                                target_ua = current_ua
+                else:
+                    # Use predefined UA
+                    if self.selected_user_agent:
+                        if self.user_agent_suffix and self.user_agent_suffix.strip():
+                            target_ua = self.selected_user_agent + " " + self.user_agent_suffix
+                        else:
+                            target_ua = self.selected_user_agent
+
+                # Only modify if the current UA doesn't match the target UA
+                if target_ua and current_ua != target_ua:
+                    # Modify the request
+                    new_request = modify_request_user_agent(
+                        self._helpers,
+                        request,
+                        self.user_agent_suffix,
+                        self.use_browser_user_agent,
+                        self.selected_user_agent,
+                        self.extension_enabled
+                    )
+
+                    # Update if modified
+                    if new_request != request:
+                        messageInfo.setRequest(new_request)
+
+            except Exception as e:
+                print("Error processing HTTP request: " + str(e))
+                import traceback
+                traceback.print_exc()
+
+        except Exception as e:
+            print("Main HTTP listener error: " + str(e))
             import traceback
             traceback.print_exc()
 
